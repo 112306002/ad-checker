@@ -1,0 +1,8 @@
+# 機密：請勿提交 API 金鑰
+backend/.env
+backend/.venv/
+__pycache__/
+*.pyc
+node_modules/
+dist/
+.DS_Store
