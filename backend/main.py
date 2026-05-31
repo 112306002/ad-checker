@@ -4,7 +4,8 @@ from pydantic import BaseModel
 from typing import Optional
 import json
 import os
-from google import genai
+import time
+from groq import Groq
 from rules import detect_violations, applicable_groups, CATEGORY_NAMES
 
 app = FastAPI(title="廣告文案品質檢測系統 API", version="1.1.0")
@@ -17,7 +18,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
 
 
 class AnalyzeRequest(BaseModel):
@@ -33,12 +34,11 @@ class Violation(BaseModel):
     law_ref: str = ""
 
 
-# 灰色地帶現在由 LLM 直接判讀，每筆包含原文片段、風險說明、法規與風險等級
 class GrayArea(BaseModel):
-    phrase: str            # LLM 從文案中抓出的原始問題片段
-    label: str             # 風險類型（例如：誇大數字宣稱）
-    reason: str            # 為何踩線的說明
-    law_ref: str = ""      # 相關法規
+    phrase: str
+    label: str
+    reason: str
+    law_ref: str = ""
     severity: str = "gray"
 
 
@@ -78,7 +78,6 @@ def get_risk_level(score):
 
 
 def build_highlighted_segments(text, violations, gray_areas):
-    """違規詞以 severity 標色；LLM 灰色地帶片段標為 gray。"""
     marked = [None] * len(text)
 
     sorted_v = sorted(violations, key=lambda v: len(v["word"]), reverse=True)
@@ -94,7 +93,6 @@ def build_highlighted_segments(text, violations, gray_areas):
                     marked[i] = v["severity"]
             start = idx + 1
 
-    # LLM 判定的灰色地帶片段
     for ga in sorted(gray_areas, key=lambda g: len(g.get("phrase", "")), reverse=True):
         phrase = ga.get("phrase", "")
         if not phrase:
@@ -128,16 +126,8 @@ def build_highlighted_segments(text, violations, gray_areas):
     return segments
 
 
-def call_gemini(text, violations, category):
-    """
-    將完整文案丟給 LLM 判讀。
-    LLM 同時負責：
-      1) 語意層級的明確違規風險 (semantic_risks)
-      2) 灰色地帶判讀 (gray_areas) — 取代原本的正則/字典查表
-      3) 修改建議與合規替代詞句
-    回傳 (ai_analysis_dict, gray_areas_list)
-    """
-    if not GEMINI_API_KEY:
+def call_llm(text, violations, category):
+    if not GROQ_API_KEY:
         return None, []
 
     cat_name = CATEGORY_NAMES.get(category, "食品")
@@ -178,14 +168,14 @@ def call_gemini(text, violations, category):
   "compliant_alternatives": ["合規替代詞句1", "合規替代詞句2"]
 }}"""
 
-    import time
+    client = Groq(api_key=GROQ_API_KEY)
 
-    client = genai.Client(api_key=GEMINI_API_KEY)
     for attempt in range(3):
         try:
-            response = client.models.generate_content(
-                model="models/gemini-2.5-flash",
-                contents=prompt,
+            response = client.chat.completions.create(
+                model="llama-3.3-70b-versatile",
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.2,
             )
             break
         except Exception as e:
@@ -194,11 +184,10 @@ def call_gemini(text, violations, category):
                 continue
             raise
 
-    raw = response.text
+    raw = response.choices[0].message.content
     clean = raw.replace("```json", "").replace("```", "").strip()
     parsed = json.loads(clean)
 
-    # 灰色地帶：取 LLM 判讀結果，補上 severity，過濾掉 phrase 不在原文的（避免標註錯位）
     gray_areas = []
     for ga in parsed.get("gray_areas", []):
         phrase = (ga.get("phrase") or "").strip()
@@ -227,7 +216,7 @@ def root():
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "ai_enabled": bool(GEMINI_API_KEY)}
+    return {"status": "ok", "ai_enabled": bool(GROQ_API_KEY)}
 
 
 @app.get("/api/rules/{category}")
@@ -244,14 +233,12 @@ def analyze(req: AnalyzeRequest):
     if req.category not in CATEGORY_NAMES:
         raise HTTPException(status_code=400, detail="無效的產品類別")
 
-    # Rule-based：只套用所選類別適用的法規
     violations = detect_violations(req.text, req.category)
 
-    # AI：語意風險 + 灰色地帶判讀（取代正則查表）
     ai_result = None
     gray_areas = []
     try:
-        ai_dict, gray_areas = call_gemini(req.text, violations, req.category)
+        ai_dict, gray_areas = call_llm(req.text, violations, req.category)
         if ai_dict:
             ai_result = AIAnalysis(**ai_dict)
     except Exception as e:
